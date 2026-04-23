@@ -261,8 +261,12 @@ struct CollectiveMainloopBwdSm90 {
     // statistic for 2 rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
-    static constexpr bool dQacc_use_TMA = kHeadDim < 256;
-    // For hdim256, we want to slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
+    // At hdim=256 the default (non-det) dispatch uses a larger kBlockN=80 tile which can't fit the
+    // smem_dqacc staging buffer; it takes the Slice_dQKV_Mma + atomicAdd path instead. The deterministic
+    // dispatch picks kBlockN<=32 so smem_dqacc (64 KB) + sQ (kStages=2 doubles it to 64 KB at kBlockM=64)
+    // fit alongside the other buffers under the 227 KB SMEM limit.
+    static constexpr bool dQacc_use_TMA = kHeadDim < 256 || (kHeadDim == 256 && kBlockN <= 32);
+    // For hdim256 non-det, we slice the dQ MMA (64 x 256 on 2 WGs) into two (64 x 128 on 2 WGs) so that we can
     // do atomic add on one half before doing the other half of the MMA, to reduce register pressure.
     static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
     static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");

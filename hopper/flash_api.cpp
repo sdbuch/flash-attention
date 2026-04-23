@@ -1367,7 +1367,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int const arch = at::cuda::getCurrentDeviceProperties()->major * 10 + at::cuda::getCurrentDeviceProperties()->minor;
     int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
     int const head_size_v_rounded = head_size_rounded;
-    TORCH_CHECK(!deterministic || head_size_rounded < 256, "Deterministic backward not supported for hdim 256.");
     // Very important that these match the kernel configs
     bool const is_local = (window_size_left >= 0 || window_size_right >= 0) && !is_causal;
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (is_causal && softcap > 0.0 ? 96 : 128)
@@ -1377,9 +1376,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
     int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    // At hdim=256 with deterministic=true, the kernel uses a smaller kBlockN=32 tile so that
+    // smem_dqacc fits in SMEM; the semaphore allocations below must match that tile size or
+    // the kernel will write past the end of dk_semaphore/dv_semaphore and hang.
     int const kBlockN_sm90 = head_size_rounded <= 128
         ? 128
-        : (head_size_rounded <= 192 ? 96 : 80);
+        : (head_size_rounded <= 192 ? 96 : (deterministic ? 32 : 80));
     int const kBlockN_sm80 = head_size_rounded <= 128
         ? 128
         : (head_size_rounded <= 192 ? 80 : 64);
