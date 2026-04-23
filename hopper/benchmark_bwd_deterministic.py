@@ -75,10 +75,11 @@ def cfg(label, *, batch, seqlen, heads, kv_heads, head_dim, causal, window):
 
 
 def main():
-    print("FA3 hdim=256 backward benchmark (bf16)")
+    print("FA3 backward benchmark (bf16)")
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print()
 
+    print("--- head_dim=256 ---")
     # Small shape — overhead should be negligible
     cfg("mha 256x256 causal",
         batch=2, seqlen=256, heads=6, kv_heads=6, head_dim=256,
@@ -102,6 +103,27 @@ def main():
     cfg("gqa 4096x4096 SWA=1024",
         batch=1, seqlen=4096, heads=6, kv_heads=2, head_dim=256,
         causal=True, window=(1024, 0))
+    cfg("gqa 4096x4096 SWA=512",
+        batch=1, seqlen=4096, heads=6, kv_heads=2, head_dim=256,
+        causal=True, window=(512, 0))
+
+    print()
+    print("--- head_dim=128 (stock FA3: same tile for det / non-det, semaphore overhead only) ---")
+    cfg("mha 256x256 causal",
+        batch=2, seqlen=256, heads=6, kv_heads=6, head_dim=128,
+        causal=True, window=(-1, -1))
+    cfg("gqa 2048x2048 causal",
+        batch=2, seqlen=2048, heads=6, kv_heads=2, head_dim=128,
+        causal=True, window=(-1, -1))
+    cfg("gqa 4096x4096 causal",
+        batch=1, seqlen=4096, heads=6, kv_heads=2, head_dim=128,
+        causal=True, window=(-1, -1))
+    cfg("gqa 4096x4096 SWA=1024",
+        batch=1, seqlen=4096, heads=6, kv_heads=2, head_dim=128,
+        causal=True, window=(1024, 0))
+    cfg("gqa 4096x4096 SWA=512",
+        batch=1, seqlen=4096, heads=6, kv_heads=2, head_dim=128,
+        causal=True, window=(512, 0))
 
 
 if __name__ == "__main__":
