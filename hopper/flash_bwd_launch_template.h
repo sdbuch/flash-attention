@@ -303,7 +303,7 @@ void run_mha_bwd_dispatch(Flash_bwd_params &params, cudaStream_t stream) {
                 // only fits at kBlockN<=64 (see dQacc_use_TMA in the mainloop). Force Deterministic
                 // off for configs that don't support it so the BOOL_SWITCH's Deterministic_=true
                 // branch doesn't instantiate an ill-formed template (Slice_dQKV_Mma + Deterministic).
-                static constexpr bool DetSupported = kHeadDim < 256 || (kHeadDim == 256 && kBlockN <= 32);
+                static constexpr bool DetSupported = kHeadDim < 256 || (kHeadDim == 256 && kBlockN <= 48);
                 static constexpr bool Deterministic = Deterministic_ && DetSupported;
                 // run_flash_bwd<kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen, false, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ>(params, stream);
                 run_flash_bwd<Arch, kHeadDim, kBlockM, kBlockN, T, Is_causal, Is_local, Has_softcap, Varlen /*Varlen*/, Deterministic /*Deterministic*/, GQA, Stages_dO, Stages_dS_or_QSm80, SdP_swapAB, dKV_swapAB, dQ_swapAB, NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, V_in_regs>(params, stream);
@@ -383,14 +383,18 @@ void run_mha_bwd_hdim256(Flash_bwd_params &params, cudaStream_t stream) {
     CAUSAL_LOCAL_SWITCH(params.is_causal, params.is_local, Is_causal, Is_local, [&] {
         if constexpr (Arch >= 90) {
             if (params.deterministic) {
-                // Deterministic hdim=256 config: shrink kBlockN to 32 to free SMEM for smem_dqacc.
-                // SMEM budget on SM90 at kBlockM=64/kHeadDim=256 with kStages=2 (Q) / 1 (dO, dS):
-                //   sQ=64 + sdO=32 + sK=16 + sV=16 + smem_dqacc=64 + sP+sdS=8 + misc=3 = ~203 KB,
-                //   comfortably under the 227 KB limit.
+                // Deterministic hdim=256 config: shrink kBlockN to 48 to free SMEM for smem_dqacc
+                // while keeping the CTA count down (2.46x more CTAs than non-det at kBlockN=80,
+                // vs the 2.5x at kBlockN=32 baseline → roughly 1.5x fewer CTAs and barrier-arrives).
+                // SMEM budget at kBlockM=64/kHeadDim=256 with kStages=2 (Q) / 1 (dO, dS):
+                //   sQ=64 + sdO=32 + sK=24 + sV=24 + smem_dqacc=64 + sP+sdS=12 + misc=3 = ~223 KB,
+                //   right under the 227 KB SMEM limit.
+                // GMMA validity: kBlockN/2=24 (SdP), kBlockN/1=48 (dKV) and kBlockM=64 (dQ) are
+                // all multiples of 8, satisfying SM90 Tile_N constraints.
                 // kBlockM must stay >= 64 (GMMA Tile_M multiple-of-64 constraint). 2 WGs / dQ_swapAB=
                 // true matches the prod hdim=256 structure; 3-WG variants don't compile since
                 // 256 isn't divisible by 3 (GMMA Tile_N multiple-of-8 violated).
-                run_mha_bwd_dispatch<Arch, T, 64, 32, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1, false>(params, stream);
+                run_mha_bwd_dispatch<Arch, T, 64, 48, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1, false>(params, stream);
             } else {
                 run_mha_bwd_dispatch<Arch, T, 64, 80, 256, Is_causal, Is_local, Has_softcap, 1, 1, false, true, true, 2, 1, 1, 1, false>(params, stream);
             }

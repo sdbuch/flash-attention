@@ -1376,12 +1376,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     int const kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
     int const kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
     int const kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
-    // At hdim=256 with deterministic=true, the kernel uses a smaller kBlockN=32 tile so that
+    // At hdim=256 with deterministic=true, the kernel uses a smaller kBlockN=48 tile so that
     // smem_dqacc fits in SMEM; the semaphore allocations below must match that tile size or
     // the kernel will write past the end of dk_semaphore/dv_semaphore and hang.
     int const kBlockN_sm90 = head_size_rounded <= 128
         ? 128
-        : (head_size_rounded <= 192 ? 96 : (deterministic ? 32 : 80));
+        : (head_size_rounded <= 192 ? 96 : (deterministic ? 48 : 80));
     int const kBlockN_sm80 = head_size_rounded <= 128
         ? 128
         : (head_size_rounded <= 192 ? 80 : 64);
