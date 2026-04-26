@@ -44,8 +44,13 @@ KEY_METRICS = [
 ]
 
 
-def fetch(report_path: str) -> dict[str, dict[str, str]]:
-    """Run ncu --import --csv and return a {kernel_name: {metric_id: value}} dict."""
+def fetch(report_path: str) -> list[dict[str, str]]:
+    """Run ncu --import --csv and return one dict per kernel-launch row.
+
+    ncu CSV schema is wide: ID, Process ID, ..., Kernel Name, Block Size,
+    Grid Size, ..., then one column per metric. We yield each row as-is and
+    let the caller pick out the metrics they want.
+    """
     metric_ids = ",".join(m[0] for m in KEY_METRICS)
     result = subprocess.run(
         [
@@ -61,40 +66,77 @@ def fetch(report_path: str) -> dict[str, dict[str, str]]:
         print(f"ncu import failed for {report_path}:", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         sys.exit(result.returncode)
-    out: dict[str, dict[str, str]] = {}
+    rows: list[dict[str, str]] = []
     reader = csv.DictReader(io.StringIO(result.stdout))
     for row in reader:
-        # Each row corresponds to one kernel launch + one metric.
-        kernel = row.get("Kernel Name", "<?>") or "<?>"
-        metric = row.get("Metric Name", "")
-        value = row.get("Metric Value", "")
-        if not metric:
+        # ncu's second header row is units — skip it
+        kernel = row.get("Kernel Name", "")
+        if not kernel or kernel.strip() == "":
             continue
-        out.setdefault(kernel, {})[metric] = value
+        rows.append(row)
+    return rows
+
+
+def short_kernel_label(full: str) -> str:
+    """Extract a short, human-readable label for a mangled FA3 kernel name."""
+    # cutlass::device_kernel<flash::XXX<...>>(...)  →  XXX
+    if "flash::" in full:
+        i = full.index("flash::") + len("flash::")
+        rest = full[i:]
+        # take the C++ identifier after flash::
+        j = 0
+        while j < len(rest) and (rest[j].isalnum() or rest[j] == "_"):
+            j += 1
+        name = rest[:j]
+        # Some kernels (FlashAttnBwdSm90) are wrapped in enable_sm90<...>;
+        # peek at the next flash:: to get the real kernel.
+        if name == "enable_sm90" and "flash::" in rest:
+            return short_kernel_label(rest)
+        return name
+    # at::vectorized_elementwise_kernel etc — shorten
+    s = full.split("(")[0]
+    s = s.split("<")[0]
+    return s.split("::")[-1][:40]
+
+
+def aggregate(rows: list[dict[str, str]]) -> dict[str, dict[str, list[float]]]:
+    """Group rows by short kernel label and collect each metric's values."""
+    out: dict[str, dict[str, list[float]]] = {}
+    for row in rows:
+        label = short_kernel_label(row["Kernel Name"])
+        bucket = out.setdefault(label, {})
+        for metric_id, _, _ in KEY_METRICS:
+            v = row.get(metric_id, "")
+            try:
+                fv = float(v.replace(",", "")) if v else None
+            except ValueError:
+                fv = None
+            if fv is not None:
+                bucket.setdefault(metric_id, []).append(fv)
     return out
 
 
-def short_kernel_name(full: str) -> str:
-    # ncu kernel names are mangled C++ — chop to a readable prefix.
-    s = full.split("(")[0]
-    s = s.split("<")[0]
-    return s[:60]
-
-
-def fmt(s: str) -> str:
-    if not s:
+def fmt(v: float | None) -> str:
+    if v is None:
         return "-"
-    try:
-        v = float(s.replace(",", ""))
-    except ValueError:
-        return s
     if abs(v) >= 1e9:
         return f"{v / 1e9:.2f}G"
     if abs(v) >= 1e6:
         return f"{v / 1e6:.2f}M"
     if abs(v) >= 1e3:
         return f"{v / 1e3:.2f}K"
-    return f"{v:.2f}" if v - int(v) else str(int(v))
+    if v == int(v):
+        return str(int(v))
+    return f"{v:.2f}"
+
+
+# Kernels relevant to the deterministic-vs-non-deterministic story.
+# Other kernels (torch fill, etc.) get filtered out of the per-kernel report.
+INTERESTING_KERNELS = {
+    "FlashAttnBwdSm90",            # the mainloop — the one that matters most
+    "FlashAttnBwdPreprocess",
+    "FlashAttnBwdPostprocessConvertdQ",
+}
 
 
 def main():
@@ -102,38 +144,63 @@ def main():
         print(__doc__, file=sys.stderr)
         sys.exit(1)
     a_path, b_path = sys.argv[1], sys.argv[2]
-    a = fetch(a_path)
-    b = fetch(b_path)
+    a = aggregate(fetch(a_path))
+    b = aggregate(fetch(b_path))
 
-    common_kernels = sorted(set(a) & set(b))
-    if not common_kernels:
-        print("no kernels common to both reports — abort", file=sys.stderr)
-        print(f"A had: {list(a)}", file=sys.stderr)
-        print(f"B had: {list(b)}", file=sys.stderr)
+    common = sorted(
+        k for k in (set(a) & set(b)) if k in INTERESTING_KERNELS
+    )
+    if not common:
+        print(
+            f"no FA3 kernels common to both reports.\n"
+            f"  A had: {sorted(a)}\n  B had: {sorted(b)}\n",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     label_a = os.path.splitext(os.path.basename(a_path))[0]
     label_b = os.path.splitext(os.path.basename(b_path))[0]
 
-    for kernel in common_kernels:
+    print(
+        f"diff: {label_a}  vs  {label_b}\n"
+        f"  Each kernel may appear in multiple invocations; we report the\n"
+        f"  median (across launches) of each metric. Kernels not common to\n"
+        f"  both reports are skipped.\n"
+    )
+
+    for kernel in common:
         ma = a[kernel]
         mb = b[kernel]
-        print(f"\n=== kernel: {short_kernel_name(kernel)} ===")
-        print(f"  {'metric':45s}  {label_a:>14s}  {label_b:>14s}  {'ratio':>8s}")
-        print(f"  {'-' * 45}  {'-' * 14:>14s}  {'-' * 14:>14s}  {'-' * 8:>8s}")
+        print(f"=== {kernel} ===")
+        print(
+            f"  {'metric':45s}  {label_a:>14s}  {label_b:>14s}  {'B/A':>8s}"
+        )
+        print(
+            f"  {'-' * 45}  {'-' * 14}  {'-' * 14}  {'-' * 8}"
+        )
+
+        def median(xs: list[float] | None) -> float | None:
+            if not xs:
+                return None
+            xs = sorted(xs)
+            mid = len(xs) // 2
+            if len(xs) % 2 == 1:
+                return xs[mid]
+            return (xs[mid - 1] + xs[mid]) / 2
+
         for metric_id, friendly, unit in KEY_METRICS:
-            va = ma.get(metric_id, "")
-            vb = mb.get(metric_id, "")
+            va = median(ma.get(metric_id))
+            vb = median(mb.get(metric_id))
             label = f"{friendly} ({unit})" if unit else friendly
-            ratio = ""
-            try:
-                fa = float(va.replace(",", ""))
-                fb = float(vb.replace(",", ""))
-                if fa != 0:
-                    ratio = f"{fb / fa:.2f}x"
-            except ValueError:
-                pass
-            print(f"  {label:45s}  {fmt(va):>14s}  {fmt(vb):>14s}  {ratio:>8s}")
+            ratio = (
+                f"{vb / va:.2f}x"
+                if va is not None and vb is not None and va != 0
+                else ""
+            )
+            print(
+                f"  {label:45s}  {fmt(va):>14s}  {fmt(vb):>14s}  {ratio:>8s}"
+            )
+        print()
 
 
 if __name__ == "__main__":
