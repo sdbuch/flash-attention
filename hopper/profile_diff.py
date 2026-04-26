@@ -16,21 +16,33 @@ import sys
 
 
 # Curated metrics that tell the story of "where did the time go?"
-# Names follow ncu's metric IDs. See `ncu --query-metrics-mode all` for the catalog.
+# Names follow ncu's metric IDs. To explore the catalog:
+#   ncu --query-metrics
+#   ncu --query-metrics-mode suffix --metrics smsp__warp_issue_stalled
 KEY_METRICS = [
     # Wall-clock (per-kernel). When comparing, biggest delta first.
-    ("gpu__time_duration.sum", "gpu time", "us"),
+    ("gpu__time_duration.sum", "gpu time", "ms"),
     ("smsp__cycles_active.avg.pct_of_peak_sustained_elapsed", "SM busy", "%"),
     # Achieved occupancy — how full the SMs actually are.
     ("sm__warps_active.avg.pct_of_peak_sustained_active", "achieved occupancy", "%"),
-    # Where warps stall. Big differences here pinpoint why kernels are slow.
-    ("smsp__warp_issue_stalled_barrier_per_warp_active.pct", "stall: barrier", "%"),
-    ("smsp__warp_issue_stalled_membar_per_warp_active.pct", "stall: membar", "%"),
-    ("smsp__warp_issue_stalled_short_scoreboard_per_warp_active.pct", "stall: short scoreboard (RAW)", "%"),
-    ("smsp__warp_issue_stalled_long_scoreboard_per_warp_active.pct", "stall: long scoreboard (memory)", "%"),
-    ("smsp__warp_issue_stalled_wait_per_warp_active.pct", "stall: wait", "%"),
+    # Where warps stall. The "_pct" suffix gives a fraction directly.
+    ("smsp__average_warps_issue_stalled_barrier_per_issue_active.ratio",
+        "stall: barrier", ""),
+    ("smsp__average_warps_issue_stalled_membar_per_issue_active.ratio",
+        "stall: membar", ""),
+    ("smsp__average_warps_issue_stalled_short_scoreboard_per_issue_active.ratio",
+        "stall: short scoreboard", ""),
+    ("smsp__average_warps_issue_stalled_long_scoreboard_per_issue_active.ratio",
+        "stall: long scoreboard (mem)", ""),
+    ("smsp__average_warps_issue_stalled_wait_per_issue_active.ratio",
+        "stall: wait", ""),
+    ("smsp__average_warps_issue_stalled_lg_throttle_per_issue_active.ratio",
+        "stall: lg throttle", ""),
     # Atomic ops — det path uses these heavily for dq_semaphore.
-    ("l1tex__t_sectors_pipe_lsu_mem_global_op_atom.sum", "global atom sectors", ""),
+    ("l1tex__t_requests_pipe_lsu_mem_global_op_atom.sum",
+        "global atom requests", ""),
+    ("l1tex__t_requests_pipe_lsu_mem_global_op_red.sum",
+        "global red requests", ""),
     # Memory throughput.
     ("dram__bytes_read.sum", "DRAM bytes read", "B"),
     ("dram__bytes_write.sum", "DRAM bytes write", "B"),
