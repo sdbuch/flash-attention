@@ -35,16 +35,16 @@ run_ncu() {
     local label="$1" det_flag="$2"
     local report="$OUT/ncu_${label}.ncu-rep"
     echo "=== ncu ${label}: ${SHAPE_ARGS} ${det_flag} ==="
-    # Skip warmup launches, profile exactly the one timed launch.
-    # --target-processes all so we catch any subprocess.
-    # --set full pulls a comprehensive metric set (slow ~30s but rich).
-    # The mainloop kernel name we care about is run_mha_bwd_*Sm90*.
+    # FA3 kernels show up as `device_kernel` (cutlass wrapper template).
+    # Each backward call issues several kernels (preprocess, mainloop,
+    # postprocess); we want all of them but skip the warmup calls.
+    # 5 warmup calls × ~3-5 kernels each ≈ 25 launches to skip; capture the
+    # next 10 (the timed call + a buffer).
     "$NCU" \
         --target-processes all \
-        --launch-skip "$WARMUP" \
-        --launch-count 100 \
+        --launch-skip 25 \
+        --launch-count 10 \
         --set full \
-        --kernel-name regex:flash \
         --force-overwrite \
         --export "${report%.ncu-rep}" \
         "$PYTHON" profile_det_bwd.py \
@@ -58,11 +58,14 @@ run_nsys() {
     local label="$1" det_flag="$2"
     local report="$OUT/nsys_${label}.nsys-rep"
     echo "=== nsys ${label}: ${SHAPE_ARGS} ${det_flag} ==="
+    # Trace the whole run; the harness already does a few warmup iterations
+    # so first-launch JIT noise is filtered out, and 20 timed iters give a
+    # clean repeating pattern in the timeline.
     "$NSYS" profile \
-        --trace=cuda,nvtx \
+        --trace=cuda,nvtx,osrt \
         --output "${report%.nsys-rep}" \
         --force-overwrite=true \
-        --capture-range cudaProfilerApi --capture-range-end stop \
+        --sample=none \
         "$PYTHON" profile_det_bwd.py \
             $SHAPE_ARGS $det_flag \
             --warmup 5 --iters 20 --mode loop \

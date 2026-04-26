@@ -55,13 +55,16 @@ def fetch(report_path: str) -> dict[str, dict[str, str]]:
             "--page", "raw",
             "--metrics", metric_ids,
         ],
-        capture_output=True, text=True, check=True,
+        capture_output=True, text=True, check=False,
     )
+    if result.returncode != 0:
+        print(f"ncu import failed for {report_path}:", file=sys.stderr)
+        print(result.stderr, file=sys.stderr)
+        sys.exit(result.returncode)
     out: dict[str, dict[str, str]] = {}
     reader = csv.DictReader(io.StringIO(result.stdout))
     for row in reader:
         # Each row corresponds to one kernel launch + one metric.
-        # ncu CSV schema: ID, Process ID, ..., Kernel Name, Section Name, Metric Name, Metric Unit, Metric Value
         kernel = row.get("Kernel Name", "<?>") or "<?>"
         metric = row.get("Metric Name", "")
         value = row.get("Metric Value", "")
