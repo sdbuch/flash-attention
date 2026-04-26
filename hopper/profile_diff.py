@@ -56,12 +56,30 @@ KEY_METRICS = [
 ]
 
 
-def fetch(report_path: str) -> list[dict[str, str]]:
-    """Run ncu --import --csv and return one dict per kernel-launch row.
+# ncu auto-scales units per metric across each report (us / ms / GB / MB / ...).
+# Rather than fight it, we normalize every metric to a canonical unit at parse time.
+UNIT_TO_CANONICAL: dict[str, tuple[str, float]] = {
+    "ns": ("us", 1e-3),
+    "us": ("us", 1.0),
+    "ms": ("us", 1e3),
+    "s":  ("us", 1e6),
+    "B":  ("KB", 1 / 1024),
+    "KB": ("KB", 1.0),
+    "MB": ("KB", 1024.0),
+    "GB": ("KB", 1024 * 1024.0),
+    "TB": ("KB", 1024 * 1024 * 1024.0),
+    "byte": ("KB", 1 / 1024),
+    "Kbyte": ("KB", 1.0),
+    "Mbyte": ("KB", 1024.0),
+    "Gbyte": ("KB", 1024 * 1024.0),
+}
 
-    ncu CSV schema is wide: ID, Process ID, ..., Kernel Name, Block Size,
-    Grid Size, ..., then one column per metric. We yield each row as-is and
-    let the caller pick out the metrics they want.
+
+def fetch(report_path: str) -> tuple[list[dict[str, str]], dict[str, str]]:
+    """Run ncu --import --csv and return rows + per-metric unit map.
+
+    ncu CSV: header row 0 is column names, header row 1 is units, rest are data.
+    We dispense with csv.DictReader since the units row breaks its expectations.
     """
     metric_ids = ",".join(m[0] for m in KEY_METRICS)
     result = subprocess.run(
@@ -78,15 +96,20 @@ def fetch(report_path: str) -> list[dict[str, str]]:
         print(f"ncu import failed for {report_path}:", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         sys.exit(result.returncode)
+    raw_rows = list(csv.reader(io.StringIO(result.stdout)))
+    if len(raw_rows) < 2:
+        return [], {}
+    headers = raw_rows[0]
+    units = raw_rows[1]
+    unit_map = {h: u for h, u in zip(headers, units)}
     rows: list[dict[str, str]] = []
-    reader = csv.DictReader(io.StringIO(result.stdout))
-    for row in reader:
-        # ncu's second header row is units — skip it
-        kernel = row.get("Kernel Name", "")
-        if not kernel or kernel.strip() == "":
+    for r in raw_rows[2:]:
+        if not r or not any(r):
             continue
-        rows.append(row)
-    return rows
+        d = {h: v for h, v in zip(headers, r)}
+        if d.get("Kernel Name", "").strip():
+            rows.append(d)
+    return rows, unit_map
 
 
 def short_kernel_label(full: str) -> str:
@@ -111,8 +134,10 @@ def short_kernel_label(full: str) -> str:
     return s.split("::")[-1][:40]
 
 
-def aggregate(rows: list[dict[str, str]]) -> dict[str, dict[str, list[float]]]:
-    """Group rows by short kernel label and collect each metric's values."""
+def aggregate(
+    rows: list[dict[str, str]], unit_map: dict[str, str]
+) -> dict[str, dict[str, list[float]]]:
+    """Group rows by short kernel label, collect metric values normalized to canonical units."""
     out: dict[str, dict[str, list[float]]] = {}
     for row in rows:
         label = short_kernel_label(row["Kernel Name"])
@@ -123,9 +148,21 @@ def aggregate(rows: list[dict[str, str]]) -> dict[str, dict[str, list[float]]]:
                 fv = float(v.replace(",", "")) if v else None
             except ValueError:
                 fv = None
-            if fv is not None:
-                bucket.setdefault(metric_id, []).append(fv)
+            if fv is None:
+                continue
+            unit = unit_map.get(metric_id, "")
+            if unit in UNIT_TO_CANONICAL:
+                _, scale = UNIT_TO_CANONICAL[unit]
+                fv = fv * scale
+            bucket.setdefault(metric_id, []).append(fv)
     return out
+
+
+def canonical_unit(metric_id: str, raw_unit_label: str) -> str:
+    """The unit our normalized values are in, given the raw unit ncu emitted."""
+    if raw_unit_label in UNIT_TO_CANONICAL:
+        return UNIT_TO_CANONICAL[raw_unit_label][0]
+    return raw_unit_label
 
 
 def fmt(v: float | None) -> str:
@@ -156,8 +193,13 @@ def main():
         print(__doc__, file=sys.stderr)
         sys.exit(1)
     a_path, b_path = sys.argv[1], sys.argv[2]
-    a = aggregate(fetch(a_path))
-    b = aggregate(fetch(b_path))
+    a_rows, a_units = fetch(a_path)
+    b_rows, b_units = fetch(b_path)
+    a = aggregate(a_rows, a_units)
+    b = aggregate(b_rows, b_units)
+    # Use whichever side has units for the report header (they should match
+    # post-normalization but the source unit can differ between reports).
+    units = a_units if a_units else b_units
 
     common = sorted(
         k for k in (set(a) & set(b)) if k in INTERESTING_KERNELS
@@ -200,10 +242,12 @@ def main():
                 return xs[mid]
             return (xs[mid - 1] + xs[mid]) / 2
 
-        for metric_id, friendly, unit in KEY_METRICS:
+        for metric_id, friendly, unit_hint in KEY_METRICS:
             va = median(ma.get(metric_id))
             vb = median(mb.get(metric_id))
-            label = f"{friendly} ({unit})" if unit else friendly
+            raw_unit = units.get(metric_id, "") or unit_hint
+            display_unit = canonical_unit(metric_id, raw_unit) if raw_unit else ""
+            label = f"{friendly} ({display_unit})" if display_unit else friendly
             ratio = (
                 f"{vb / va:.2f}x"
                 if va is not None and vb is not None and va != 0
