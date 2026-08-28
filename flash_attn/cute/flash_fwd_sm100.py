@@ -39,7 +39,7 @@ from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner, normalize_sink_lse_stats
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -2725,25 +2725,45 @@ class FlashAttentionForwardSm100:
                     row_sum = sScale[tidx + stage * self.m_block_size]
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                        row_max_log2 = row_max * softmax_scale_log2_eff
                     else:
-                        row_max = None
+                        row_max_log2 = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
+                    token_row_sum = row_sum
+                    output_row_sum = row_sum
+                    lse_row_sum = row_sum
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
                         sink_val = learnable_sink_val[stage]
                         if const_expr(not self.is_split_kv) or split_idx == 0:
                             if row_max == -Float32.inf:
                                 # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
-                                row_sum = max_offset_scale
+                                output_row_sum = max_offset_scale
+                                lse_row_sum = max_offset_scale
+                                row_max_log2 = sink_val * LOG2_E
                             else:
                                 row_sum += cute.math.exp2(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset, fastmath=True
+                                    sink_val * LOG2_E - row_max_log2 + max_offset,
+                                    fastmath=True,
                                 )
-                    acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-                    stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                                output_row_sum = row_sum
+                    acc_O_mn_row_is_zero_or_nan = (
+                        output_row_sum == 0.0 or output_row_sum != output_row_sum
+                    )
+                    scale = cute.arch.rcp_approx(
+                        output_row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0
+                    )
                     scale = scale * v_descale
+                    if const_expr(learnable_sink is not None):
+                        if const_expr(not self.is_split_kv) or split_idx == 0:
+                            if row_max != -Float32.inf:
+                                lse_row_sum, row_max_log2 = normalize_sink_lse_stats(
+                                    token_row_sum,
+                                    row_max_log2,
+                                    sink_val,
+                                    max_offset,
+                                )
+                    stats[stage] = (lse_row_sum, row_max_log2, acc_O_mn_row_is_zero_or_nan)
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
@@ -2807,8 +2827,6 @@ class FlashAttentionForwardSm100:
                         sm_stats_consumer_phase,
                         o_corr_consumer_phase,
                         corr_epi_producer_phase,
-                        softmax_scale_log2_eff,
-                        max_offset,
                         max_offset_scale,
                         mO_cur,
                         gO,
@@ -2831,12 +2849,12 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                    row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
+                    row_sum, row_max_log2, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                    #     cute.printf("row_sum = {}, row_max_log2 = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max_log2, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                        (row_max_log2 + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )

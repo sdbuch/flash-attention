@@ -856,8 +856,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
     sm_stats_consumer_phase: Int32,
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
-    softmax_scale_log2: Float32,
-    max_offset: Float32,
     max_offset_scale: Float32,
     mO_cur: Optional[cute.Tensor] = None,
     gO: Optional[cute.Tensor] = None,
@@ -883,7 +881,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
-        row_max_value = (
+        lse_row_sum = row_sum_value
+        row_max_log2 = (
             -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
         )
         if const_expr(learnable_sink is not None):
@@ -896,21 +895,16 @@ def handle_block_sparse_empty_tile_correction_sm100(
                 ) % qhead_per_kvhead + head_idx * qhead_per_kvhead
                 sink_val = Float32(learnable_sink[q_head_idx])
             if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
-                if row_max_value == -Float32.inf:
-                    row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
-                    row_sum_value = max_offset_scale
-                else:
-                    row_sum_value = row_sum_value + cute.math.exp2(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
-                        fastmath=True,
-                    )
+                row_sum_value = max_offset_scale
+                lse_row_sum = max_offset_scale
+                row_max_log2 = sink_val * LOG2_E
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
-        acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
-        stats[stage] = (row_sum_value, row_max_value, acc_flag)
+                sScale[scale_row_idx + q_stage * m_block_size] = row_max_log2
+        acc_flag = lse_row_sum == Float32(0.0) or lse_row_sum != lse_row_sum
+        stats[stage] = (lse_row_sum, row_max_log2, acc_flag)
 
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)

@@ -17,6 +17,29 @@ from flash_attn.cute.utils import AuxData
 
 
 @cute.jit
+def normalize_sink_lse_stats(
+    row_sum: Float32,
+    row_max_log2: Float32,
+    sink_val: Float32,
+    max_offset: Float32 = 0.0,
+) -> Tuple[Float32, Float32]:
+    """Move sink-inclusive row statistics into their final-max frame for LSE."""
+    LOG2_E = math.log2(math.e)
+    sink_log2 = sink_val * LOG2_E
+    final_row_max_log2 = cute.arch.fmax(row_max_log2, sink_log2)
+    final_row_max_log2_safe = 0.0 if final_row_max_log2 == -Float32.inf else final_row_max_log2
+    token_scale = cute.math.exp2(
+        row_max_log2 - final_row_max_log2_safe,
+        fastmath=True,
+    )
+    sink_scale = cute.math.exp2(
+        sink_log2 - final_row_max_log2_safe + max_offset,
+        fastmath=True,
+    )
+    return row_sum * token_scale + sink_scale, final_row_max_log2
+
+
+@cute.jit
 def call_score_mod(
     score_mod: cutlass.Constexpr,
     score,
@@ -207,6 +230,7 @@ class Softmax(ParamsBase):
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
             row_max_scaled = row_max[r] * scale_log2
             if cutlass.const_expr(sink_val is not None):
+                token_row_sum = row_sum[r]
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
                 if row_max[r] == -Float32.inf:
@@ -220,11 +244,23 @@ class Softmax(ParamsBase):
             ) * final_scale
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
-            row_sum[r] = (
-                (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
-                if not acc_O_mn_row_is_zero_or_nan
-                else -Float32.inf
-            )
+            if cutlass.const_expr(sink_val is not None):
+                lse_row_sum, final_row_max_log2 = normalize_sink_lse_stats(
+                    token_row_sum,
+                    row_max[r] * scale_log2,
+                    sink_val_cur,
+                )
+                row_sum[r] = (
+                    (final_row_max_log2 + cute.math.log2(lse_row_sum, fastmath=True)) * LN2
+                    if not acc_O_mn_row_is_zero_or_nan
+                    else -Float32.inf
+                )
+            else:
+                row_sum[r] = (
+                    (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                    if not acc_O_mn_row_is_zero_or_nan
+                    else -Float32.inf
+                )
         return row_scale
 
     @cute.jit

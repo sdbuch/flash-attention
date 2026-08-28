@@ -564,6 +564,10 @@ def _flash_attn_fwd(
 
     Args:
         ...
+        learnable_sink: Per-query-head sink logits. Values must be finite or
+            `-inf`; `-inf` disables the sink for that head. NaN and `+inf` are
+            unsupported. As in other FA4 paths, softmax contributions more than
+            roughly 87 nats below the row maximum may underflow to zero.
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
@@ -3391,6 +3395,13 @@ def flash_attn_func(
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
+    """Apply dense FlashAttention.
+
+    `learnable_sink` values must be finite or `-inf`; `-inf` disables the sink
+    for that head. NaN and `+inf` are unsupported. As in other FA4 paths,
+    softmax contributions more than roughly 87 nats below the row maximum may
+    underflow to zero.
+    """
     return FlashAttnFunc.apply(
         q,
         k,
@@ -3479,6 +3490,11 @@ def flash_attn_varlen_func(
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
+
+    learnable_sink values must be finite or -inf; -inf disables the sink for
+        that head. NaN and +inf are unsupported. As in other FA4 paths,
+        softmax contributions more than roughly 87 nats below the row maximum
+        may underflow to zero.
 
     scheduler_metadata: optional tensors used by certain tile schedulers, for optimization
         and functionality. computed in get_scheduler_metadata.
